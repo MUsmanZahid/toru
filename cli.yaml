@@ -1,0 +1,35 @@
+name: toru
+about: A command line task manager
+subcommands:
+    - add:
+        about: Adds a task
+        args:
+            - name:
+                value_name: NAME
+                help: The name of the task to add
+                required: true
+    - complete:
+        about: Complete a task
+        args:
+            - id:
+                value_name: ID
+                help: The index of the task to complete
+                required: true
+    - delete:
+        about: Deletes a task
+        args:
+            - id:
+                value_name: ID
+                help: The index of the task to delete
+                required: true
+    - down:
+        about: Move `down` one level in the task hierarchy
+        args:
+            - id:
+                value_name: ID
+                help: The index of the task to move down to
+                required: true
+    - list:
+        about: Print the current state of the task list
+    - up:
+        about: Move `up` one level in the task hierarchy
