@@ -9,7 +9,6 @@ edition = "2018"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.8"
-clap = { version = "~2.27.0", features = ["yaml"] }
 
 [profile.release]
 opt-level = 'z'
