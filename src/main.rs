@@ -1,8 +1,9 @@
-use clap::{self, load_yaml, App, ArgMatches};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::{self, Display, Formatter},
     fs::File,
+    io::{self, Stdin, Stdout, Write},
+    str::FromStr,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,6 +76,21 @@ impl Task {
     fn is_child(&self, id: usize) -> bool {
         self.children.contains(&id)
     }
+
+    fn from_stdin(
+        in_handle: &Stdin,
+        out_handle: &mut Stdout,
+        parent_idx: usize,
+    ) -> Self {
+        let mut buffer = String::with_capacity(40);
+        out_handle.write(b"Name: ").unwrap();
+        out_handle.flush().unwrap();
+        in_handle.read_line(&mut buffer).unwrap();
+
+        Task::new()
+            .with_name(buffer.trim_end().to_string())
+            .set_parent(parent_idx)
+    }
 }
 
 impl Display for Task {
@@ -84,14 +100,14 @@ impl Display for Task {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct State {
+struct Tree {
     ptr: usize,
     tasks: Vec<Task>,
 }
 
-impl State {
+impl Tree {
     fn new() -> Self {
-        State {
+        Self {
             ptr: 0,
             tasks: vec![Task::new()],
         }
@@ -135,106 +151,38 @@ impl State {
             .map(|&index| (index, self.tasks.get(index).unwrap()))
             .collect()
     }
+}
 
-    fn add(mut self, args: &ArgMatches) -> Self {
-        let task = Task::new()
-            .with_name(String::from(args.value_of("name").unwrap()))
-            .set_parent(self.ptr);
+enum ToruError {
+    ParseCommandFailure,
+}
 
-        let index_of_child = self.tasks.len();
-        let new_parent = self.get_current_owned().add_child(index_of_child);
-        self.tasks.push(task);
-        self.replace_current(new_parent)
-    }
+#[derive(Debug)]
+enum Command {
+    Add,
+    Ascend,
+    Complete,
+    Delete,
+    Descend,
+    List,
+    Help,
+    Exit,
+}
 
-    fn ascend(mut self) -> Self {
-        if self.ptr == 0 {
-            return self;
-        }
+impl FromStr for Command {
+    type Err = ToruError;
 
-        let parent = self.get_current().parent.unwrap(); // Panics if a task points to an invalid parent position
-        self.ptr = parent;
-        self
-    }
-
-    fn complete(self, args: &ArgMatches) -> Self {
-        let task_id = match args.value_of("id").unwrap().parse::<usize>() {
-            Ok(id) => id,
-            Err(e) => {
-                println!("{}", e);
-                return self;
-            }
-        };
-
-        let completed_task = self.get_task_owned(task_id).unwrap().complete(); // Panics if the supplied task id does not exist
-        self.replace_task(task_id, completed_task)
-    }
-
-    fn delete(mut self, args: &ArgMatches) -> Self {
-        let remove_id = match args.value_of("id").unwrap().parse::<usize>() {
-            Ok(id) => id,
-            Err(e) => {
-                println!("{}", e);
-                return self;
-            }
-        };
-
-        if remove_id == 0 {
-            return self;
-        }
-
-        let mut parent_id = self.get_task(remove_id).unwrap().parent.unwrap(); // Panics if supplied task does not exist and if it's parent does not exist
-        let mut new_parent = self
-            .get_task_owned(parent_id)
-            .unwrap() // Panics if the task given does not exist
-            .remove_child(remove_id);
-        self = self.replace_task(parent_id, new_parent);
-        self.tasks.swap_remove(remove_id);
-
-        // The task we just swap_removed has the index tasks.len() - 1 before
-        // we removed it, hence it is just tasks.len() now. We now need to
-        // update the swapped task's parent to point to the correct index.
-        let id_to_replace = self.tasks.len();
-        parent_id = match self.get_task(remove_id) {
-            Some(id) => id.parent.unwrap(), // Panics if the task's parent does not exist
-            // If the location we just swap_removed does not exist, the task to
-            // delete was the last in the list and we can stop here
-            None => return self,
-        };
-        new_parent = self
-            .get_task_owned(parent_id)
-            .unwrap() // Panics if the current task does not exist
-            .replace_child(id_to_replace, remove_id);
-        self.replace_task(parent_id, new_parent)
-    }
-
-    fn descend(mut self, args: &ArgMatches) -> Self {
-        let descend_id = match args.value_of("id").unwrap().parse::<usize>() {
-            Ok(id) => id,
-            Err(e) => {
-                println!("{}", e);
-                return self;
-            }
-        };
-
-        if self.get_current().is_child(descend_id) {
-            self.ptr = descend_id;
-        }
-
-        self
-    }
-
-    fn list(&self) {
-        if !self.at_root() {
-            println!("Task - {}", self.get_current());
-        }
-
-        for (id, task) in self
-            .get_children()
-            .iter()
-            .filter(|(_, task)| !task.is_complete())
-        {
-            println!("{}. {}", id, task);
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "add" => Ok(Self::Add),
+            "up" => Ok(Self::Ascend),
+            "del" => Ok(Self::Delete),
+            "done" => Ok(Self::Complete),
+            "down" => Ok(Self::Descend),
+            "list" => Ok(Self::List),
+            "help" => Ok(Self::Help),
+            "exit" => Ok(Self::Exit),
+            _ => Err(Self::Err::ParseCommandFailure),
         }
     }
 }
@@ -242,27 +190,140 @@ impl State {
 const FILE_NAME: &'static str = ".toru.yaml";
 
 fn main() {
-    let clap_config = load_yaml!("../cli.yaml");
-    let matches = App::from_yaml(clap_config).get_matches();
-
-    let mut state = match File::open(FILE_NAME) {
-        Ok(file) => serde_yaml::from_reader(file).expect("Error deserialising"),
-        Err(_) => State::new(),
+    let mut tree = match File::open(FILE_NAME) {
+        Ok(file) => serde_yaml::from_reader(file).unwrap(),
+        Err(_) => Tree::new(),
     };
 
-    state = match matches.subcommand() {
-        ("add", Some(sub_matches)) => state.add(sub_matches),
-        ("up", Some(_)) => state.ascend(),
-        ("complete", Some(sub_matches)) => state.complete(sub_matches),
-        ("delete", Some(sub_matches)) => state.delete(sub_matches),
-        ("down", Some(sub_matches)) => state.descend(sub_matches),
-        ("list", Some(_)) => {
-            state.list();
-            state
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut buffer = String::with_capacity(100);
+
+    while let Ok(a) = stdin.read_line(&mut buffer) {
+        if a == 0 {
+            break;
         }
-        _ => state,
+        let cmd = match buffer.trim_end().parse::<Command>() {
+            Ok(cmd) => cmd,
+            Err(_) => Command::Help,
+        };
+
+        tree = match cmd {
+            Command::Add => {
+                let parent_idx = tree.ptr;
+                add(tree, Task::from_stdin(&stdin, &mut stdout, parent_idx))
+            }
+            Command::Ascend => ascend(tree),
+            Command::Complete => {
+                complete(tree, index_from_stdin(&stdin, &mut stdout))
+            }
+            Command::Delete => {
+                delete(tree, index_from_stdin(&stdin, &mut stdout))
+            }
+            Command::Descend => {
+                descend(tree, index_from_stdin(&stdin, &mut stdout))
+            }
+            Command::List => {
+                list(&tree);
+                tree
+            }
+            Command::Help => {
+                help();
+                tree
+            }
+            Command::Exit => {
+                break;
+            }
+        };
+
+        buffer.clear();
+    }
+
+    serde_yaml::to_writer(File::create(FILE_NAME).unwrap(), &tree).unwrap()
+}
+
+fn index_from_stdin(in_handle: &Stdin, out_handle: &mut Stdout) -> usize {
+    let mut buffer = String::with_capacity(4);
+    out_handle.write(b"Index: ").unwrap();
+    out_handle.flush().unwrap();
+    in_handle.read_line(&mut buffer).unwrap();
+
+    buffer.trim_end().parse::<usize>().unwrap()
+}
+
+fn add(mut tree: Tree, task: Task) -> Tree {
+    let index_of_child = tree.tasks.len();
+    let new_parent = tree.get_current_owned().add_child(index_of_child);
+    tree.tasks.push(task);
+    tree.replace_current(new_parent)
+}
+
+fn ascend(mut tree: Tree) -> Tree {
+    if tree.at_root() {
+        return tree;
+    }
+
+    let parent = tree.get_current().parent.unwrap();
+    tree.ptr = parent;
+    tree
+}
+
+fn complete(tree: Tree, idx: usize) -> Tree {
+    let complete_task = tree.get_task_owned(idx).unwrap().complete();
+    tree.replace_task(idx, complete_task)
+}
+
+fn delete(mut tree: Tree, idx: usize) -> Tree {
+    if idx == 0 {
+        return tree;
+    }
+
+    let mut parent_idx = tree.get_task(idx).unwrap().parent.unwrap();
+    let mut new_parent =
+        tree.get_task_owned(parent_idx).unwrap().remove_child(idx);
+
+    tree = tree.replace_task(parent_idx, new_parent);
+    tree.tasks.swap_remove(idx);
+
+    // Need to update the parent of the task we just swap_removed to point to
+    // the correct index (the index we just deleted)
+    let idx_to_replace = tree.tasks.len();
+    parent_idx = match tree.get_task(idx) {
+        Some(id) => id.parent.unwrap(),
+        // If there is nothing at the index we just deleted then we were
+        // deleting the last node in the tree
+        None => return tree,
     };
 
-    serde_yaml::to_writer(File::create(FILE_NAME).unwrap(), &state)
-        .expect("Error serialising")
+    new_parent = tree
+        .get_task_owned(parent_idx)
+        .unwrap()
+        .replace_child(idx_to_replace, idx);
+    tree.replace_task(parent_idx, new_parent)
+}
+
+fn descend(mut tree: Tree, idx: usize) -> Tree {
+    if tree.get_current().is_child(idx) {
+        tree.ptr = idx;
+    }
+
+    tree
+}
+
+fn help() {
+    println!("This is the help message.");
+}
+
+fn list(tree: &Tree) {
+    if !tree.at_root() {
+        println!("Task - {}", tree.get_current());
+    }
+
+    for (id, task) in tree
+        .get_children()
+        .iter()
+        .filter(|(_, task)| !task.is_complete())
+    {
+        println!("{}. {}", id, task);
+    }
 }
