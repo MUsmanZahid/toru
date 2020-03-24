@@ -73,6 +73,10 @@ impl Task {
         self
     }
 
+    fn has_children(&self) -> bool {
+        !self.children.is_empty()
+    }
+
     fn is_child(&self, id: usize) -> bool {
         self.children.contains(&id)
     }
@@ -143,17 +147,28 @@ impl Tree {
         self
     }
 
-    fn get_children(&self) -> Vec<(usize, &Task)> {
+    fn get_children(&self) -> Vec<&Task> {
         let parent = self.get_current();
         let children = &parent.children;
         children
             .iter()
-            .map(|&index| (index, self.tasks.get(index).unwrap()))
+            .map(|&index| self.tasks.get(index).unwrap())
             .collect()
+    }
+
+    fn nth_child(&self, idx: usize) -> Result<usize, ToruError> {
+        self.get_current()
+            .children
+            .iter()
+            .nth(idx)
+            .and_then(|&nth| Some(nth))
+            .ok_or(ToruError::InvalidIndex)
     }
 }
 
+#[derive(Debug)]
 enum ToruError {
+    InvalidIndex,
     ParseCommandFailure,
 }
 
@@ -188,6 +203,7 @@ impl FromStr for Command {
 }
 
 const FILE_NAME: &'static str = ".toru.yaml";
+const PROMPT: &'static str = "toru> ";
 
 fn main() {
     let mut tree = match File::open(FILE_NAME) {
@@ -199,10 +215,18 @@ fn main() {
     let mut stdout = io::stdout();
     let mut buffer = String::with_capacity(100);
 
-    while let Ok(a) = stdin.read_line(&mut buffer) {
-        if a == 0 {
-            break;
-        }
+    loop {
+        write!(stdout, "{}", PROMPT).unwrap();
+        stdout.flush().unwrap();
+        match stdin.read_line(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => (),
+            Err(e) => {
+                eprintln!("{}", e);
+                break;
+            }
+        };
+
         let cmd = match buffer.trim_end().parse::<Command>() {
             Ok(cmd) => cmd,
             Err(_) => Command::Help,
@@ -224,11 +248,11 @@ fn main() {
                 descend(tree, index_from_stdin(&stdin, &mut stdout))
             }
             Command::List => {
-                list(&tree);
+                list(&mut stdout, &tree);
                 tree
             }
             Command::Help => {
-                help();
+                help(&mut stdout);
                 tree
             }
             Command::Exit => {
@@ -269,11 +293,13 @@ fn ascend(mut tree: Tree) -> Tree {
 }
 
 fn complete(tree: Tree, idx: usize) -> Tree {
+    let idx = tree.nth_child(idx).unwrap();
     let complete_task = tree.get_task_owned(idx).unwrap().complete();
     tree.replace_task(idx, complete_task)
 }
 
 fn delete(mut tree: Tree, idx: usize) -> Tree {
+    let idx = tree.nth_child(idx).unwrap();
     if idx == 0 {
         return tree;
     }
@@ -303,6 +329,7 @@ fn delete(mut tree: Tree, idx: usize) -> Tree {
 }
 
 fn descend(mut tree: Tree, idx: usize) -> Tree {
+    let idx = tree.nth_child(idx).unwrap();
     if tree.get_current().is_child(idx) {
         tree.ptr = idx;
     }
@@ -310,11 +337,26 @@ fn descend(mut tree: Tree, idx: usize) -> Tree {
     tree
 }
 
-fn help() {
-    println!("This is the help message.");
+fn help(handle: &mut Stdout) {
+    let help = vec![
+        "add - Add a task.",
+        "delete - Delete a task.",
+        "done - Complete a task.",
+        "down - Traverse 'down' into a task.",
+        "exit - Exit toru.",
+        "help - Show the help message.",
+        "list - Print current task and its children",
+        "up - Traverse 'up' to a tasks' parent",
+    ];
+
+    writeln!(handle, "\nToru help:").unwrap();
+    for msg in help {
+        writeln!(handle, "{}", msg).unwrap();
+    }
+    writeln!(handle, "").unwrap();
 }
 
-fn list(tree: &Tree) {
+fn list(handle: &mut Stdout, tree: &Tree) {
     if !tree.at_root() {
         println!("Task - {}", tree.get_current());
     }
@@ -322,8 +364,19 @@ fn list(tree: &Tree) {
     for (id, task) in tree
         .get_children()
         .iter()
-        .filter(|(_, task)| !task.is_complete())
+        .filter(|task| !task.is_complete())
+        .enumerate()
     {
-        println!("{}. {}", id, task);
+        writeln!(
+            handle,
+            "{}. {}",
+            id,
+            if task.has_children() {
+                format!("+ {}", task)
+            } else {
+                format!("  {}", task)
+            }
+        )
+        .unwrap();
     }
 }
