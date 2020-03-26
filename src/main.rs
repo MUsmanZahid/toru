@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    env,
     fmt::{self, Display, Formatter},
     fs::File,
     io::{self, Stdin, Stdout, Write},
+    num::ParseIntError,
     str::FromStr,
 };
 
@@ -87,7 +89,7 @@ impl Task {
         parent_idx: usize,
     ) -> Self {
         let mut buffer = String::with_capacity(40);
-        out_handle.write(b"Name: ").unwrap();
+        write!(out_handle, "Name> ").unwrap();
         out_handle.flush().unwrap();
         in_handle.read_line(&mut buffer).unwrap();
 
@@ -159,17 +161,31 @@ impl Tree {
     fn nth_child(&self, idx: usize) -> Result<usize, ToruError> {
         self.get_current()
             .children
-            .iter()
-            .nth(idx)
+            .get(idx)
             .and_then(|&nth| Some(nth))
-            .ok_or(ToruError::InvalidIndex)
+            .ok_or(ToruError::InvalidIndex(idx))
     }
 }
 
 #[derive(Debug)]
 enum ToruError {
-    InvalidIndex,
+    InvalidIndex(usize),
     ParseCommandFailure,
+}
+
+impl Display for ToruError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let msg = match self {
+            Self::InvalidIndex(idx) => {
+                format!("Child at index {} does not exist", idx)
+            }
+            Self::ParseCommandFailure => {
+                String::from("Failed to parse command")
+            }
+        };
+
+        write!(f, "{}", msg)
+    }
 }
 
 #[derive(Debug)]
@@ -206,7 +222,16 @@ const FILE_NAME: &'static str = ".toru.yaml";
 const PROMPT: &'static str = "toru> ";
 
 fn main() {
-    let mut tree = match File::open(FILE_NAME) {
+    let key = "HOME";
+    let full_path = match env::var(key) {
+        Ok(home) => format!("{}/{}", home, FILE_NAME),
+        Err(e) => {
+            eprintln!("{}", e);
+            return;
+        }
+    };
+
+    let mut tree = match File::open(&full_path) {
         Ok(file) => serde_yaml::from_reader(file).unwrap(),
         Err(_) => Tree::new(),
     };
@@ -239,13 +264,13 @@ fn main() {
             }
             Command::Ascend => ascend(tree),
             Command::Complete => {
-                complete(tree, index_from_stdin(&stdin, &mut stdout))
+                verify_index_and(&stdin, &mut stdout, tree, complete)
             }
             Command::Delete => {
-                delete(tree, index_from_stdin(&stdin, &mut stdout))
+                verify_index_and(&stdin, &mut stdout, tree, delete)
             }
             Command::Descend => {
-                descend(tree, index_from_stdin(&stdin, &mut stdout))
+                verify_index_and(&stdin, &mut stdout, tree, descend)
             }
             Command::List => {
                 list(&mut stdout, &tree);
@@ -262,17 +287,44 @@ fn main() {
 
         buffer.clear();
     }
-
-    serde_yaml::to_writer(File::create(FILE_NAME).unwrap(), &tree).unwrap()
+    writeln!(stdout, "Saving...").unwrap();
+    serde_yaml::to_writer(File::create(&full_path).unwrap(), &tree).unwrap()
 }
 
-fn index_from_stdin(in_handle: &Stdin, out_handle: &mut Stdout) -> usize {
+fn verify_index_and<F>(
+    in_handle: &Stdin,
+    out_handle: &mut Stdout,
+    tree: Tree,
+    f: F,
+) -> Tree
+where
+    F: FnOnce(Tree, usize) -> Tree,
+{
+    match index_from_stdin(in_handle, out_handle) {
+        Ok(idx) => match tree.nth_child(idx) {
+            Ok(nth) => f(tree, nth),
+            Err(e) => {
+                eprintln!("{}", e);
+                tree
+            }
+        },
+        Err(e) => {
+            eprintln!("{}", e);
+            tree
+        }
+    }
+}
+
+fn index_from_stdin(
+    in_handle: &Stdin,
+    out_handle: &mut Stdout,
+) -> Result<usize, ParseIntError> {
     let mut buffer = String::with_capacity(4);
-    out_handle.write(b"Index: ").unwrap();
+    write!(out_handle, "Index> ").unwrap();
     out_handle.flush().unwrap();
     in_handle.read_line(&mut buffer).unwrap();
 
-    buffer.trim_end().parse::<usize>().unwrap()
+    buffer.trim_end().parse::<usize>()
 }
 
 fn add(mut tree: Tree, task: Task) -> Tree {
@@ -287,19 +339,20 @@ fn ascend(mut tree: Tree) -> Tree {
         return tree;
     }
 
-    let parent = tree.get_current().parent.unwrap();
-    tree.ptr = parent;
+    match tree.get_current().parent {
+        Some(parent) => tree.ptr = parent,
+        None => unreachable!(),
+    }
+
     tree
 }
 
 fn complete(tree: Tree, idx: usize) -> Tree {
-    let idx = tree.nth_child(idx).unwrap();
     let complete_task = tree.get_task_owned(idx).unwrap().complete();
     tree.replace_task(idx, complete_task)
 }
 
 fn delete(mut tree: Tree, idx: usize) -> Tree {
-    let idx = tree.nth_child(idx).unwrap();
     if idx == 0 {
         return tree;
     }
@@ -329,7 +382,6 @@ fn delete(mut tree: Tree, idx: usize) -> Tree {
 }
 
 fn descend(mut tree: Tree, idx: usize) -> Tree {
-    let idx = tree.nth_child(idx).unwrap();
     if tree.get_current().is_child(idx) {
         tree.ptr = idx;
     }
@@ -357,9 +409,13 @@ fn help(handle: &mut Stdout) {
 }
 
 fn list(handle: &mut Stdout, tree: &Tree) {
-    if !tree.at_root() {
-        println!("Task - {}", tree.get_current());
-    }
+    let base = if tree.at_root() {
+        String::from("Root")
+    } else {
+        format!("Task - {}", tree.get_current())
+    };
+
+    writeln!(handle, "{}", base).unwrap();
 
     for (id, task) in tree
         .get_children()
@@ -367,16 +423,12 @@ fn list(handle: &mut Stdout, tree: &Tree) {
         .filter(|task| !task.is_complete())
         .enumerate()
     {
-        writeln!(
-            handle,
-            "{}. {}",
-            id,
-            if task.has_children() {
-                format!("+ {}", task)
-            } else {
-                format!("  {}", task)
-            }
-        )
-        .unwrap();
+        let subchildren_indicator = if task.has_children() {
+            format!("+ {}", task)
+        } else {
+            format!("  {}", task)
+        };
+
+        writeln!(handle, "{}. {}", id, subchildren_indicator).unwrap();
     }
 }
