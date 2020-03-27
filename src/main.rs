@@ -6,6 +6,7 @@ use std::{
     io::{self, Stdin, Stdout, Write},
     num::ParseIntError,
     str::FromStr,
+    path::Path,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -139,6 +140,13 @@ impl Tree {
         self.tasks.get(id).and_then(|task| Some(task.clone()))
     }
 
+    fn has_pending(&self, task: &Task) -> bool {
+        self
+            .get_children_of(task)
+            .iter()
+            .any(|child| !child.is_complete())
+    }
+
     fn replace_current(mut self, new_task: Task) -> Self {
         self.tasks[self.ptr] = new_task;
         self
@@ -152,6 +160,14 @@ impl Tree {
     fn get_children(&self) -> Vec<&Task> {
         let parent = self.get_current();
         let children = &parent.children;
+        children
+            .iter()
+            .map(|&index| self.tasks.get(index).unwrap())
+            .collect()
+    }
+
+    fn get_children_of(&self, task: &Task) -> Vec<&Task> {
+        let children = &task.children;
         children
             .iter()
             .map(|&index| self.tasks.get(index).unwrap())
@@ -218,13 +234,18 @@ impl FromStr for Command {
     }
 }
 
-const FILE_NAME: &'static str = ".toru.yaml";
 const PROMPT: &'static str = "toru> ";
 
 fn main() {
-    let key = "HOME";
+    let file_name = Path::new(".toru.yaml");
+    let key = if cfg!(windows) {
+        "HOMEPATH"
+    } else {
+        "HOME"
+    };
+
     let full_path = match env::var(key) {
-        Ok(home) => format!("{}/{}", home, FILE_NAME),
+        Ok(home) => Path::new(&home).join(file_name),
         Err(e) => {
             eprintln!("{}", e);
             return;
@@ -423,7 +444,7 @@ fn list(handle: &mut Stdout, tree: &Tree) {
         .filter(|task| !task.is_complete())
         .enumerate()
     {
-        let subchildren_indicator = if task.has_children() {
+        let subchildren_indicator = if task.has_children() && tree.has_pending(task) {
             format!("+ {}", task)
         } else {
             format!("  {}", task)
