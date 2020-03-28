@@ -5,9 +5,11 @@ use std::{
     fs::File,
     io::{self, Stdin, Stdout, Write},
     num::ParseIntError,
-    str::FromStr,
     path::Path,
+    str::FromStr,
+    time::SystemTime,
 };
+use time::PrimitiveDateTime;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum Tag {
@@ -19,6 +21,7 @@ enum Tag {
 struct Task {
     parent: Option<usize>,
     name: String,
+    due: Option<PrimitiveDateTime>,
     tag: Tag,
     children: Vec<usize>,
 }
@@ -28,6 +31,7 @@ impl Task {
         Task {
             parent: None,
             name: String::from("Default"),
+            due: None,
             tag: Tag::Pending,
             children: Vec::new(),
         }
@@ -40,6 +44,11 @@ impl Task {
 
     fn with_name(mut self, name: String) -> Self {
         self.name = name;
+        self
+    }
+
+    fn due_at(mut self, date: PrimitiveDateTime) -> Self {
+        self.due = Some(date);
         self
     }
 
@@ -88,21 +97,41 @@ impl Task {
         in_handle: &Stdin,
         out_handle: &mut Stdout,
         parent_idx: usize,
-    ) -> Self {
-        let mut buffer = String::with_capacity(40);
+    ) -> Result<Self, time::ParseError> {
+        let mut date = String::with_capacity(40);
+        let date_format = "%F %I:%M %p";
+        let now = PrimitiveDateTime::from(SystemTime::now());
+        let mut name = String::with_capacity(40);
+
         write!(out_handle, "Name> ").unwrap();
         out_handle.flush().unwrap();
-        in_handle.read_line(&mut buffer).unwrap();
+        in_handle.read_line(&mut name).unwrap();
 
-        Task::new()
-            .with_name(buffer.trim_end().to_string())
-            .set_parent(parent_idx)
+        write!(out_handle, "Due [{}]> ", now.format(date_format)).unwrap();
+        out_handle.flush().unwrap();
+        in_handle.read_line(&mut date).unwrap();
+
+        let date = date.trim_end();
+
+        let task = Task::new()
+            .with_name(name.trim_end().to_string())
+            .set_parent(parent_idx);
+        Ok(if date.is_empty() {
+            task
+        } else {
+            task.due_at(time::parse(date, date_format)?)
+        })
     }
 }
 
 impl Display for Task {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name)
+        match self.due {
+            Some(due) => {
+                write!(f, "{} | {}", self.name, due.format("%I:%M %p %F"))
+            }
+            None => write!(f, "{}", self.name),
+        }
     }
 }
 
@@ -141,8 +170,7 @@ impl Tree {
     }
 
     fn has_pending(&self, task: &Task) -> bool {
-        self
-            .get_children_of(task)
+        self.children_of(task)
             .iter()
             .any(|child| !child.is_complete())
     }
@@ -157,7 +185,7 @@ impl Tree {
         self
     }
 
-    fn get_children(&self) -> Vec<&Task> {
+    fn children(&self) -> Vec<&Task> {
         let parent = self.get_current();
         let children = &parent.children;
         children
@@ -166,7 +194,7 @@ impl Tree {
             .collect()
     }
 
-    fn get_children_of(&self, task: &Task) -> Vec<&Task> {
+    fn children_of(&self, task: &Task) -> Vec<&Task> {
         let children = &task.children;
         children
             .iter()
@@ -174,10 +202,23 @@ impl Tree {
             .collect()
     }
 
+    fn pending_children(&self) -> Vec<&Task> {
+        self.children()
+            .iter()
+            .filter(|&child| !child.is_complete())
+            .map(|&task| task)
+            .collect()
+    }
+
     fn nth_child(&self, idx: usize) -> Result<usize, ToruError> {
         self.get_current()
             .children
-            .get(idx)
+            .iter()
+            .filter(|&&task_idx| {
+                let task = self.get_task(task_idx).unwrap();
+                !task.is_complete()
+            })
+            .nth(idx)
             .and_then(|&nth| Some(nth))
             .ok_or(ToruError::InvalidIndex(idx))
     }
@@ -234,15 +275,9 @@ impl FromStr for Command {
     }
 }
 
-const PROMPT: &'static str = "toru> ";
-
 fn main() {
     let file_name = Path::new(".toru.yaml");
-    let key = if cfg!(windows) {
-        "HOMEPATH"
-    } else {
-        "HOME"
-    };
+    let key = if cfg!(windows) { "HOMEPATH" } else { "HOME" };
 
     let full_path = match env::var(key) {
         Ok(home) => Path::new(&home).join(file_name),
@@ -261,8 +296,10 @@ fn main() {
     let mut stdout = io::stdout();
     let mut buffer = String::with_capacity(100);
 
+    let prompt = "toru> ";
+
     loop {
-        write!(stdout, "{}", PROMPT).unwrap();
+        write!(stdout, "{}", prompt).unwrap();
         stdout.flush().unwrap();
         match stdin.read_line(&mut buffer) {
             Ok(0) => break,
@@ -281,7 +318,13 @@ fn main() {
         tree = match cmd {
             Command::Add => {
                 let parent_idx = tree.ptr;
-                add(tree, Task::from_stdin(&stdin, &mut stdout, parent_idx))
+                match Task::from_stdin(&stdin, &mut stdout, parent_idx) {
+                    Ok(task) => add(tree, task),
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        tree
+                    }
+                }
             }
             Command::Ascend => ascend(tree),
             Command::Complete => {
@@ -430,26 +473,31 @@ fn help(handle: &mut Stdout) {
 }
 
 fn list(handle: &mut Stdout, tree: &Tree) {
-    let base = if tree.at_root() {
-        String::from("Root")
+    let label = if tree.at_root() {
+        String::from("Home")
     } else {
-        format!("Task - {}", tree.get_current())
+        format!("\u{2191}\n{}", tree.get_current())
     };
 
-    writeln!(handle, "{}", base).unwrap();
+    writeln!(
+        handle,
+        "\n{}\n{:-<underline$}",
+        label,
+        "",
+        underline = label.len()
+    )
+    .unwrap();
 
-    for (id, task) in tree
-        .get_children()
-        .iter()
-        .filter(|task| !task.is_complete())
-        .enumerate()
-    {
-        let subchildren_indicator = if task.has_children() && tree.has_pending(task) {
-            format!("+ {}", task)
-        } else {
-            format!("  {}", task)
-        };
+    for (id, task) in tree.pending_children().iter().enumerate() {
+        let subchildren_indicator =
+            if task.has_children() && tree.has_pending(task) {
+                format!("+ {}", task)
+            } else {
+                format!("  {}", task)
+            };
 
         writeln!(handle, "{}. {}", id, subchildren_indicator).unwrap();
     }
+
+    writeln!(handle, "").unwrap();
 }
