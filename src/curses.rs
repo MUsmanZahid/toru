@@ -1,30 +1,47 @@
 use crate::task::Task;
 use crate::tree::{self, Tree};
 use crossterm::{
-    cursor,
-    event::{poll, read, Event, KeyCode},
+    cursor::{self, MoveTo},
+    event::{poll, read, Event, KeyCode, KeyEvent, KeyModifiers},
     style::Print,
     terminal::{
-        disable_raw_mode, enable_raw_mode, Clear, ClearType,
+        self, disable_raw_mode, enable_raw_mode, Clear, ClearType,
         EnterAlternateScreen, LeaveAlternateScreen,
     },
-    QueueableCommand,
+    ExecutableCommand, QueueableCommand,
 };
-use std::{
-    env,
-    error::Error,
-    fs::File,
-    io::{self, Write},
-    path::Path,
-    time::Duration,
-};
+use std::{env, error::Error, fs::File, io, path::Path, time::Duration};
 use tui::{
-    backend::{Backend, CrosstermBackend},
+    backend::CrosstermBackend,
     layout::{Constraint, Layout},
-    style::{Color, Modifier, Style},
-    widgets::{Block, List, ListState, Text},
+    style::{Modifier, Style},
+    widgets::{Block, Borders, List, ListState, Text},
     Terminal,
 };
+
+#[derive(PartialEq)]
+enum InputType {
+    Direct,
+    Text,
+}
+
+struct Input {
+    prompt: String,
+    cursor_offset: usize,
+    input_type: InputType,
+    buffer: String,
+}
+
+impl Default for Input {
+    fn default() -> Self {
+        Self {
+            prompt: String::from("Input:"),
+            cursor_offset: 0,
+            input_type: InputType::Direct,
+            buffer: String::with_capacity(40),
+        }
+    }
+}
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let file_name = Path::new(".toru.yaml");
@@ -39,21 +56,20 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         let file = file.unwrap();
         serde_yaml::from_reader::<_, Tree>(file)?
     } else {
-        Tree::new()
+        let tree = Tree::new();
+        let task = Task::new()
+            .set_name("Task 1".to_string())
+            .set_parent(tree.ptr());
+        tree::add(tree, task)
     };
 
-    let out = io::stdout();
-    let mut stdout = out.lock();
+    let mut input_state = Input::default();
+
+    let mut out = io::stdout();
     enable_raw_mode()?;
-    stdout.queue(cursor::Hide)?.queue(EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    out.queue(cursor::Hide)?.queue(EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
-
-    let rebuild_list = |tree: &Tree| {
-        StatefulList::new(
-            tree.pending_children().map(|c| c.name().clone()).collect(),
-        )
-    };
 
     let mut list = rebuild_list(&tree);
 
@@ -61,25 +77,54 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         terminal.draw(|mut f| {
             let frame_size = f.size();
             let chunks = Layout::default()
-                .constraints([Constraint::Min(0), Constraint::Max(2)].as_ref())
+                .constraints([Constraint::Min(1), Constraint::Min(1)].as_ref())
                 .split(frame_size);
             let items = list.items.iter().map(|i| Text::raw(i));
             let title = format!("Toru: {}", tree.current().name());
             let items = List::new(items)
-                .block(Block::default().title(title.as_str()))
-                .style(Style::default())
-                .highlight_style(
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .modifier(Modifier::BOLD),
+                .block(
+                    Block::default()
+                        .title(title.as_str())
+                        .title_style(Style::default().modifier(Modifier::BOLD))
+                        .borders(Borders::ALL),
                 )
+                .style(Style::default())
+                .highlight_style(Style::default().modifier(Modifier::REVERSED))
                 .highlight_symbol(">");
             f.render_stateful_widget(items, chunks[0], &mut list.state);
         })?;
 
+        if input_state.input_type == InputType::Text {
+            let cur_offset = &mut input_state.cursor_offset;
+            let buffer = &mut input_state.buffer;
+
+            let in_prompt =
+                format!("{}{}", input_state.prompt, buffer.as_str());
+            let inlen = in_prompt.len();
+
+            let (_, rows) = terminal::size()?;
+
+            terminal
+                .backend_mut()
+                .queue(MoveTo(1, rows))?
+                .queue(Print(in_prompt))?
+                .queue(MoveTo((1 + inlen - *cur_offset) as u16, rows))?
+                .execute(cursor::Show)?;
+
+            if let Ok(true) = poll(Duration::from_millis(150)) {
+                tree = handle_input(&mut input_state, tree, &mut list)?;
+            }
+
+            terminal
+                .backend_mut()
+                .queue(Clear(ClearType::CurrentLine))?
+                .queue(cursor::Hide)?;
+            continue;
+        }
+
         if let Ok(true) = poll(Duration::from_millis(150)) {
-            if let Ok(Event::Key(key)) = read() {
-                match key.code {
+            if let Ok(Event::Key(KeyEvent { code, .. })) = read() {
+                match code {
                     KeyCode::Char('q') => break,
                     KeyCode::Char('c') => {
                         let current = list.state.selected().unwrap();
@@ -88,13 +133,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         list = rebuild_list(&tree);
                     }
                     KeyCode::Char('a') => {
-                        let name = get_input(terminal.backend_mut(), "Name: ")?;
-                        if name == "\0" {
-                            continue;
-                        }
-                        let task =
-                            Task::new().set_name(name).set_parent(tree.ptr());
-                        tree = tree::add(tree, task);
+                        input_state.input_type = InputType::Text;
+                    }
+                    KeyCode::Char('d') => {
+                        let current = list.state.selected().unwrap();
+                        let current = tree.nth_child(current)?;
+                        tree = tree::delete(tree, current);
+                        list = rebuild_list(&tree);
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        tree = tree::ascend(tree);
                         list = rebuild_list(&tree);
                     }
                     KeyCode::Up | KeyCode::Char('k') => list.previous(),
@@ -103,10 +151,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         let current = list.state.selected().unwrap();
                         let current = tree.nth_child(current)?;
                         tree = tree::descend(tree, current);
-                        list = rebuild_list(&tree);
-                    }
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        tree = tree::ascend(tree);
                         list = rebuild_list(&tree);
                     }
                     _ => {}
@@ -121,10 +165,88 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     terminal
         .backend_mut()
         .queue(cursor::Show)?
-        .queue(LeaveAlternateScreen)?;
+        .execute(LeaveAlternateScreen)?;
     disable_raw_mode()?;
 
     Ok(())
+}
+
+fn rebuild_list(tree: &Tree) -> StatefulList {
+    StatefulList::new(
+        tree.pending_children()
+            .map(|c| {
+                if c.has_children() {
+                    format!("+ {}", c.name().clone())
+                } else {
+                    format!("  {}", c.name().clone())
+                }
+            })
+            .collect(),
+    )
+}
+
+fn handle_input(
+    input: &mut Input,
+    mut tree: Tree,
+    list: &mut StatefulList,
+) -> Result<Tree, Box<dyn Error>> {
+    let (cols, _) = terminal::size()?;
+    let len = input.buffer.len();
+    let in_len = len + input.prompt.len();
+    if let Event::Key(KeyEvent { code, modifiers }) = read()? {
+        match code {
+            KeyCode::Right => {
+                if input.cursor_offset > 0 {
+                    input.cursor_offset -= 1;
+                }
+            }
+            KeyCode::Left => {
+                if input.cursor_offset < len {
+                    input.cursor_offset += 1;
+                }
+            }
+            KeyCode::Esc => {
+                input.buffer.clear();
+                input.input_type = InputType::Direct;
+            }
+            KeyCode::Delete => {
+                let idx = len - input.cursor_offset;
+                if idx < len {
+                    input.buffer.remove(idx);
+                    input.cursor_offset -= 1;
+                }
+            }
+            KeyCode::Backspace => {
+                let idx = len - input.cursor_offset;
+                if 0 < idx && idx <= len {
+                    input.buffer.remove(idx - 1);
+                }
+            }
+            KeyCode::Enter => {
+                input.input_type = InputType::Direct;
+                input.cursor_offset = 0;
+                let task = Task::new()
+                    .set_name(input.buffer.clone())
+                    .set_parent(tree.ptr());
+                tree = tree::add(tree, task);
+                input.buffer.clear();
+                *list = rebuild_list(&tree);
+            }
+            KeyCode::Char(c) => {
+                if modifiers == KeyModifiers::CONTROL && c == 'c' {
+                    input.input_type = InputType::Direct;
+                    input.buffer.clear();
+                }
+                let cols = (cols - 1) as usize;
+                if cols > in_len {
+                    input.buffer.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(tree)
 }
 
 struct StatefulList {
@@ -171,58 +293,4 @@ impl StatefulList {
 
         self.state.select(Some(i));
     }
-}
-
-fn get_input<B>(stdout: &mut B, prompt: &str) -> Result<String, Box<dyn Error>>
-where
-    B: Backend + Write,
-{
-    let (_, rows) = crossterm::terminal::size()?;
-    let mut buffer = String::with_capacity(40);
-
-    stdout
-        .queue(cursor::MoveTo(1, rows))?
-        .queue(Print(format!("{}", prompt)))?
-        .queue(cursor::Show)?;
-    Write::flush(stdout)?;
-
-    let (zero_col, _) = cursor::position()?;
-
-    loop {
-        if let Event::Key(event) = read()? {
-            match event.code {
-                KeyCode::Backspace => {
-                    let (cur_col, _) = cursor::position()?;
-                    if cur_col == zero_col {
-                        buffer.push('\0');
-                        break;
-                    }
-                    buffer.pop();
-                    stdout
-                        .queue(cursor::MoveLeft(1))?
-                        .queue(Print(" "))?
-                        .queue(cursor::MoveLeft(1))?;
-                    Write::flush(stdout)?;
-                }
-                KeyCode::Enter => break,
-                KeyCode::Esc => {
-                    buffer.clear();
-                    buffer.push('\0');
-                    break;
-                }
-                KeyCode::Char(c) => {
-                    buffer.push(c);
-                    write!(stdout, "{}", c)?;
-                    Write::flush(stdout)?;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    stdout
-        .queue(cursor::Hide)?
-        .queue(Clear(ClearType::CurrentLine))?;
-    Write::flush(stdout)?;
-    Ok(buffer)
 }

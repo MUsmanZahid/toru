@@ -63,7 +63,7 @@ impl Task {
     pub fn new() -> Self {
         Task {
             parent: None,
-            name: String::from("Default"),
+            name: String::from("Root"),
             due: None,
             status: Status::Pending,
             children: Vec::new(),
