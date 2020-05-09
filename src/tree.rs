@@ -17,13 +17,13 @@ impl<'a> Iterator for Children<'a> {
     type Item = &'a Task;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.current >= self.indexes.len() {
-            None
-        } else {
+        if self.current < self.indexes.len() {
+            let idx = self.indexes.get(self.current)?;
             self.current += 1;
-            let idx = self.indexes.get(self.current - 1).unwrap();
-            Some(self.tasks.get(*idx).unwrap())
+            return self.tasks.get(*idx);
         }
+
+        None
     }
 }
 
@@ -74,7 +74,7 @@ impl Tree {
     }
 
     pub fn task_owned(&self, id: usize) -> Option<Task> {
-        self.tasks.get(id).and_then(|task| Some(task.clone()))
+        self.tasks.get(id).cloned()
     }
 
     pub fn has_pending(&self, task: &Task) -> bool {
@@ -91,13 +91,13 @@ impl Tree {
         self
     }
 
-    pub fn children(&self) -> Children<'_> {
+    pub fn children(&self) -> Children {
         let parent = self.current();
         let children = parent.children();
         Children {
             current: 0,
             indexes: children,
-            tasks: &self.tasks(),
+            tasks: self.tasks(),
         }
     }
 
@@ -111,7 +111,7 @@ impl Tree {
     }
 
     pub fn pending_children(&self) -> impl Iterator<Item = &'_ Task> {
-        self.children().filter(|child| !child.is_complete())
+        self.children().filter(|&child| !child.is_complete())
     }
 
     pub fn nth_child(&self, idx: usize) -> Result<usize, ToruError> {
@@ -119,11 +119,13 @@ impl Tree {
             .children()
             .iter()
             .filter(|&&task_idx| {
-                let task = self.task(task_idx).unwrap();
+                let task = self.task(task_idx).unwrap_or_else(|| {
+                    panic!("Invalid access of task {}", task_idx)
+                });
                 !task.is_complete()
             })
             .nth(idx)
-            .and_then(|&nth| Some(nth))
+            .copied()
             .ok_or(ToruError::InvalidIndex(idx))
     }
 }
@@ -148,9 +150,29 @@ pub fn ascend(mut tree: Tree) -> Tree {
     tree
 }
 
-pub fn complete(tree: Tree, idx: usize) -> Tree {
-    let complete_task = tree.task_owned(idx).unwrap().complete();
-    tree.replace_task(idx, complete_task)
+pub fn complete(mut tree: Tree, idx: usize) -> Tree {
+    if idx == 0 {
+        return tree;
+    }
+
+    let mut ptr = 0;
+    let mut stack = Vec::new();
+    stack.push(idx);
+
+    while ptr < stack.len() {
+        let idx = stack[ptr];
+        let completed_task =
+            match tree.task_owned(idx).map(|task| task.complete()) {
+                Some(t) => t,
+                None => panic!("Invalid index access at {}", idx),
+            };
+
+        stack.extend(completed_task.children().iter());
+        tree = tree.replace_task(idx, completed_task);
+        ptr += 1;
+    }
+
+    tree
 }
 
 pub fn delete(mut tree: Tree, idx: usize) -> Tree {
@@ -158,33 +180,120 @@ pub fn delete(mut tree: Tree, idx: usize) -> Tree {
         return tree;
     }
 
-    let mut parent_idx = tree.task(idx).unwrap().parent().unwrap();
-    let mut new_parent = tree.task_owned(parent_idx).unwrap().remove_child(idx);
+    let mut stack = Vec::new();
+    stack.push(idx);
 
-    tree = tree.replace_task(parent_idx, new_parent);
-    tree.tasks_mut().swap_remove(idx);
+    while !stack.is_empty() {
+        let child_index = match stack.last().cloned() {
+            Some(i) => i,
+            None => unreachable!(),
+        };
+        let child_task = match tree.task(child_index) {
+            Some(t) => t,
+            None => {
+                stack.pop();
+                continue;
+            }
+        };
 
-    // Need to update the parent of the task we just swap removed to point to
-    // the correct index (the index we just deleted)
-    let idx_to_replace = tree.tasks().len();
-    parent_idx = match tree.task(idx) {
-        Some(id) => id.parent().unwrap(),
-        // If there is nothing at the index we just deleted then we were
-        // deleting the last node in the tree
-        None => return tree,
-    };
+        let children = child_task.children();
 
-    new_parent = tree
-        .task_owned(parent_idx)
-        .unwrap()
-        .replace_child(idx_to_replace, idx);
-    tree.replace_task(parent_idx, new_parent)
+        if !children.is_empty() {
+            stack.extend(children.iter());
+            continue;
+        }
+
+        let mut parent_index = match tree.task(child_index) {
+            Some(t) => match t.parent() {
+                Some(p) => p,
+                None => unreachable!(),
+            },
+            None => unreachable!(),
+        };
+        let mut new_parent = match tree.task_owned(parent_index) {
+            Some(t) => t.remove_child(child_index),
+            None => unreachable!(),
+        };
+
+        tree = tree.replace_task(parent_index, new_parent);
+        tree.tasks_mut().swap_remove(child_index);
+
+        // Need to update parent of the task we just swapped
+        let index_to_replace = tree.tasks().len();
+        parent_index = match tree.task(child_index) {
+            Some(t) => t.parent().unwrap(),
+            None => {
+                // If there is no task at the one we just deleted we deleted the last node and don't
+                // need to do anything else
+                stack.pop();
+                continue;
+            }
+        };
+        new_parent = match tree.task_owned(parent_index) {
+            Some(t) => t.replace_child(index_to_replace, child_index),
+            None => unreachable!(),
+        };
+        tree = tree.replace_task(parent_index, new_parent);
+
+        stack.pop();
+    }
+
+    tree
 }
 
 pub fn descend(mut tree: Tree, idx: usize) -> Tree {
-    if tree.current().is_child(idx) {
+    if tree.current().has_child_with_index(idx) {
         tree.set_ptr(idx);
     }
 
     tree
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn spawn_tree() -> Tree {
+        let mut tree = Tree::new();
+        tree = add(tree, Task::new().set_parent(0));
+        tree = add(tree, Task::new().set_parent(0));
+        tree.set_ptr(1);
+        tree = add(tree, Task::new().set_parent(1));
+        tree = add(tree, Task::new().set_parent(1));
+        tree.set_ptr(2);
+        tree = add(tree, Task::new().set_parent(2));
+        tree = add(tree, Task::new().set_parent(2));
+        tree.set_ptr(3);
+        tree = add(tree, Task::new().set_parent(3));
+        tree = add(tree, Task::new().set_parent(3));
+        tree.set_ptr(4);
+        tree = add(tree, Task::new().set_parent(4));
+
+        tree
+    }
+
+    #[test]
+    fn multi_level_delete() {
+        let mut tree = spawn_tree();
+        tree = delete(tree, 1);
+
+        assert_eq!(tree.tasks().len(), 4);
+    }
+
+    #[test]
+    fn single_level_delete() {
+        let mut tree = spawn_tree();
+        tree = delete(tree, 9);
+
+        assert_eq!(tree.tasks().len(), 9);
+    }
+
+    #[test]
+    fn multi_level_complete() {
+        let mut tree = spawn_tree();
+        tree.set_ptr(1);
+
+        tree = complete(tree, 1);
+        assert!(tree.pending_children().next().is_none());
+    }
 }

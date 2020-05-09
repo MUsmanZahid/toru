@@ -259,8 +259,8 @@ impl StatefulList {
         let mut state = ListState::default();
         state.select(Some(0));
         StatefulList {
-            state: state,
-            items: items,
+            state,
+            items,
         }
     }
 

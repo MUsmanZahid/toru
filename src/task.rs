@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use time::PrimitiveDateTime;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 /// Enum that represents the current state of a task. Currently this is
 /// primarily used to differentiate between pending and completed tasks,
 /// however, it may see some other uses in the future.
@@ -222,11 +222,7 @@ impl Task {
     /// ```
     ///
     pub fn is_complete(&self) -> bool {
-        if let Status::Complete = self.status {
-            true
-        } else {
-            false
-        }
+        self.status == Status::Complete
     }
 
     /// Add a child index to a task's children.
@@ -314,7 +310,7 @@ impl Task {
     /// assert!(!task.is_child(2));
     /// ```
     ///
-    pub fn is_child(&self, id: usize) -> bool {
+    pub fn has_child_with_index(&self, id: usize) -> bool {
         self.children.contains(&id)
     }
 }
