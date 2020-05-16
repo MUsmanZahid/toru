@@ -131,6 +131,7 @@ impl Tree {
 }
 
 pub fn add(mut tree: Tree, task: Task) -> Tree {
+    let task = task.set_parent(tree.ptr());
     let index_of_child = tree.tasks().len();
     let new_parent = tree.current_owned().add_child(index_of_child);
     tree.tasks_mut().push(task);

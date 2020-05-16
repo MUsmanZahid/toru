@@ -1,28 +1,49 @@
 mod cli;
-mod curses;
 mod task;
 mod tree;
+mod tui;
 
 use cli::CLI;
-use std::{env, error::Error, fmt};
+use std::{env, error::Error, fmt, fs::File, path::Path};
+use tree::Tree;
 
-fn main() -> Result<(), Box<dyn Error>> {
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
+fn main() -> Result<()> {
+    let file_name = Path::new(".toru.yaml");
+    let key = if cfg!(windows) { "HOMEPATH" } else { "HOME" };
+
+    let path = match env::var(key) {
+        Ok(home) => Path::new(&home).join(file_name),
+        Err(_) => file_name.to_path_buf(),
+    };
+
+    let file = File::open(&path);
+
+    let mut tree = if let Ok(file) = file {
+        serde_yaml::from_reader::<_, Tree>(file).unwrap()
+    } else {
+        Tree::new()
+    };
+
     if let Some(value) = env::args().nth(1) {
         if value == "-i" {
-            CLI::default().run()
+            CLI::default().run()?;
         } else if value == "-s" {
             // Server branch
-            Ok(())
         } else {
-            Err(Box::new(ToruError::InstantiateError))
+            Err(Box::new(ToruError::InstantiateError))?;
         }
+    } else if cfg!(windows) {
+        CLI::default().run()?;
     } else {
-        if cfg!(windows) {
-            CLI::default().run()
-        } else {
-            curses::run()
-        }
+        tree = tui::run(tree)?;
     }
+
+    let file = File::create(&path)?;
+    serde_yaml::to_writer(file, &tree)?;
+
+    Ok(())
 }
 
 #[derive(Debug)]
