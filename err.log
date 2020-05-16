@@ -1,3 +1,0 @@
-    Finished dev [unoptimized + debuginfo] target(s) in 0.02s
-     Running `target/debug/toru`
-Error: Custom { kind: Other, error: "Cursor position detection timed out." }
